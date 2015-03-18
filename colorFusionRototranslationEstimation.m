@@ -6,6 +6,11 @@ function [R, T] = colorFusionRototranslationEstimation(srcColorFrame, srcDepthFr
     
     depth2DMatches = mapColorToIrCamera(color2DMatches, srcDepthFrame, tgtDepthFrame);
 	
+	if(isempty(depth2DMatches))
+		R = nan;
+		T = nan;
+		return;
+	end
 	[srcIrU, srcIrV] = ind2sub(size(srcDepthFrame),depth2DMatches(1,:));
 	[tgtIrU, tgtIrV] = ind2sub(size(tgtDepthFrame),depth2DMatches(2,:));
 	
@@ -58,47 +63,94 @@ function [filteredMatches] = getConsistentMatches(matches, scores, frameSize)
 end
 
 function [irMatches] = mapColorToIrCamera(color2DMatches, srcIrFrame, tgtIrFrame)
-	irSrcPointsLinearized = zeros(1,size(color2DMatches,2));
-	irTgtPointsLinearized = zeros(1,size(color2DMatches,2));
+	irMatches = [];
 	
-	for(i=1:size(color2DMatches,2))
-		[rgbSrcU, rgbSrcV] = ind2sub(size(srcIrFrame),color2DMatches(1,i));
-		[rgbTgtU, rgbTgtV] = ind2sub(size(srcIrFrame),color2DMatches(2,i));
+	for(colorPointPair=color2DMatches)
+		[rgbSrcU, rgbSrcV] = ind2sub(size(srcIrFrame),colorPointPair(1));
+		[rgbTgtU, rgbTgtV] = ind2sub(size(srcIrFrame),colorPointPair(2);
 		
 		[irSrcU, irSrcV] = convertToIr([rgbSrcU; rgbSrcV], srcIrFrame);
 		[irTgtU, irTgtV] = convertToIr([rgbTgtU; rgbTgtV], tgtIrFrame);
 		
-		irSrcPointsLinearized(1,i) = sub2ind(size(srcIrFrame), irSrcU, irSrcV);
-		irTgtPointsLinearized(2,i) = sub2ind(size(tgtIrFrame), irTgtU, irTgtV);
+		if(~isnan(irSrcU*irTgtU))
+			irMatches = [irMatches, [sub2ind(size(srcIrFrame), irSrcU, irSrcV); sub2ind(size(tgtIrFrame), irTgtU, irTgtV)]];
+		end
 	end
-	
-	irMatches = [irSrcPointsLinearized; irTgtPointsLinearized];	
 end
 
 function [irU, irV] = convertToIr(rgbPixel, irImage)
-	windowSearchSize = [21 21];
+	windowSearchSize = [11 11];
+	nearTresh = 5; %Maximum distance for valid mapping
+	
 	[minU, maxU, minV, maxV] = searchBounds(rgbPixel, size(irImage), windowSearchSize);
 	
+	Ugrid = repmat((minU:maxU)',1,maxV-minV+1);
+	Vgrid = repmat((minV:maxV), maxU-minU+1,1);
+	Zgrid = single(irImage(minV:maxV, minU:maxU));
+	Zgrid(Zgrid==0)=nan;
+	
+	%%{
+	% Without for loop
+	irXYZ = [Vgrid(:)'.*Zgrid(:)'; Ugrid(:)'.*Zgrid(:)'; Zgrid(:)'];
+	rgbXYZ = calib_KK_right*(calib_R*inv(calib_KK_left)*irXYZ + repmat(calib_T,1,size(irXYZ,2)));
+	rgbVU = round(rgbXYZ./repmat(rgbXYZ(3),3,1));
+	rgbUV = [rgbVU(2,:); rgbVU(1,:)]
+	
+	distances = sqrt(sum((rgbUV - repmat(rgbPixel,1,size(irXYZ,2))).^2,2));
+	
+	[minValue, minIdx] = min(distances);
+	%If there's no valid match or rgb mapped point is too far from original rgb point, return nan
+	if(isnan(minValue) || minValue > nearTresh)
+		irU = nan;
+		irV = nan;
+		return;
+	end
+	
+	irU = rgbUV(1,minIdx);
+	irV = rgbUV(2,minIdx);
+	%}
+	
+	%{
+	% With for loop
 	irCandidatePixels = [];
 	distances = [];
 	
 	for(u=minU:maxU)
 		for(v=minV:maxV)
-			irCandidatePixels = [irCandidatePixels, [u,v]];
-			
 			%Calibration uses [v;u] instead of [u;v]
 			z = single(irImage(u,v));
+			%Exclude saturated depth pixels
+			if(z==0)
+				continue;
+			end
+			
 			irXYZ = [v*z; u*z; z];
 			rgbXYZ = calib_KK_right*(calib_R*inv(calib_KK_left)*irXYZ + calib_T);
 			rgbVU = round(rgbXYZ./rgbXYZ(3));
 			rgbUV = [rgbVU(2);rgbVU(1)];
 			
+			irCandidatePixels = [irCandidatePixels, [u,v]];
 			distances = [distances, norm(rgbPixel - rgbUV)];
 		end
 	end
 	
-	[~, minIdx] = min(distances);
-	[irU, irV] = irCandidatePixels(:,minIdx);
+	if(isempty(irCandidatePixels))
+		irU = nan;
+		irV = nan;
+		return;
+	end
+	
+	[minValue, minIdx] = min(distances);
+	%If rgb mapped point is too far from original rgb point, return nan
+	if(minValue > nearTresh)
+		irU = nan;
+		irV = nan;
+		return;
+	end
+	
+	irU = irCandidatePixels(1,minIdx);
+	irV = irCandidatePixels(2,minIdx);
+	%}
 end
 
 function [minU, maxU, minV, maxV] = searchBounds(rgbPixel, imageSize, windowSearchSize)
